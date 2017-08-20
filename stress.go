@@ -1,279 +1,267 @@
-package stress
+package main
 
 import (
-	"bytes"
-	"crypto/tls"
-	"io"
+	"encoding/json"
+	"flag"
+	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/http/httptrace"
-	"net/url"
+	gurl "net/url"
 	"os"
-	"sync"
-	"time"
+	"regexp"
+	"strings"
 
-	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
+
+	lbstress "stress/stress"
 )
 
-type (
-	//Task contains the stress test configuration and request configuration.
-	Task struct {
-		// Request is the request to be made.
-		Request *http.Request
-		//ReqBody is the request of body.
-		ReqBody []byte
-		//Nuber is the total number of requests to send.
-		Number int
-		//Concurrent is the concurrent number of requests.
-		Concurrent int
-		Output     string
-		//Timeout is the timeout of request in seconds.
-		Timeout int
-		//ThinkTime is the think time of request in seconds.
-		ThinkTime int
-		// ProxyAddr is the address of HTTP proxy server in the format on "host:port".
-		ProxyAddr *url.URL
-		Dialers   []proxy.Dialer
-		//H2 is an option to make HTTP/2 requests.
-		H2 bool
-		//DisableCompression is an option to disable compression in response.
-		DisableCompression bool
-		//DisableKeepAlives is an option to prevents re-use of TCP connections between different HTTP requests.
-		DisableKeepAlives bool
-		//DisableRedirects is an option to prevent the following of HTTP redirects.
-		DisableRedirects bool
+var (
+	m        = flag.String("m", "GET", "")
+	body     = flag.String("b", "", "")
+	bodyFile = flag.String("B", "", "")
 
-		//The total think time required for all requests.
-		thinkDuration time.Duration
-		start         time.Time
-		results       chan *Result
-	}
+	output    = flag.String("o", "", "")
+	proxyAddr = flag.String("x", "", "")
+	host      = flag.String("host", "", "")
+
+	n         = flag.Int("n", 100, "")
+	c         = flag.Int("c", 10, "")
+	t         = flag.Int("t", 20, "")
+	thinkTime = flag.Int("think-time", 0, "")
+
+	h2                 = flag.Bool("h2", false, "")
+	disableCompression = flag.Bool("disable-compression", false, "")
+	disableKeepalive   = flag.Bool("disable-keepalive", false, "")
+	disableRedirects   = flag.Bool("disable-redirects", false, "")
+
+	socket5 = flag.String("socket5", "", "")
 )
 
-//Run is run a task.
-func (t *Task) Run() error {
-	if t.Number > 0 {
-		t.results = make(chan *Result, t.Number)
+const (
+	headerRegexp = `^([\w-]+):\s*(.+)`
+	authRegexp   = `^(.+):([^\s].+)`
+
+	methodsRegexp   = `m:([a-zA-Z]+),*`
+	bodyRegexp      = `b:([^,]+),*`
+	bodyFileRegexp  = `B:([^,]+),*`
+	proxyAddrRegexp = `x:([^,]+),*`
+	thinkTimeRegexp = `thinkTime:([\d]+),*`
+)
+
+var usage = `Usage: stress [options...] <url> 
+
+Options:
+  -n  Number of requests to run. Default value is 100.
+      If set to -1, the request has been sent, but the report will 
+      not be output by default.
+  -c  Number of requests to run concurrently. 
+      Total number of requests cannot smaller than the concurrency level. 
+      Default value is 10.
+  -o  Output type. If none provided, a summary is printed.
+      "csv" is the only supported alternative. Dumps the response
+      metrics in comma-separated values format.
+  
+  -h  Custom HTTP header. For example: 
+      -h "Accept: text/html" -h "Content-Type: application/xml".
+  -m  HTTP method, any of GET, POST, PUT, DELETE, HEAD, OPTIONS.
+  -t  Timeout for each request in seconds. Default value is 20, 
+      use 0 for infinite.
+  -b  HTTP request body.
+  -B  HTTP request body from file. For example:
+      /home/user/file.txt or ./file.txt.
+  -x  HTTP Proxy address as host:port.
+
+  -h2 	 Enable HTTP/2.
+  -host	 Set HTTP Host header.
+
+  -socket5              Set Socket5 config from file.For example:
+                        /home/user/socket5.json or ./socket5.json.
+  -think-time           Time to think after request. Default value is 0 sec.
+  -disable-compression  Disable compression.
+  -disable-keepalive    Disable keep-alive, prevents re-use of TCP
+                    	connections between different HTTP requests.
+  -disable-redirects    Disable following of HTTP redirects.
+`
+
+func main() {
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, usage)
 	}
-	t.start = time.Now()
-	t.runRequesters()
-	t.finish()
-	return nil
+	var hs headerSlice
+	flag.Var(&hs, "h", "")
+	flag.Parse()
+	if flag.NArg() <= 0 {
+		usageAndExit("")
+	}
+	num := *n
+	conc := *c
+	if num == 0 {
+		usageAndExit("-n cannot be smaller than 1")
+	}
+	if conc <= 0 {
+		usageAndExit("-c cannot be smaller than 1.")
+	}
+	if num > 0 && num < conc {
+		usageAndExit("-n cannot be less than -c.")
+	}
+
+	url := flag.Args()[0]
+	method := strings.ToUpper(*m)
+
+	//Parsing global request header.
+	header := make(http.Header)
+	for _, h := range hs {
+		match, err := parseInputWithRegexp(h, headerRegexp)
+		if err != nil {
+			usageAndExit(err.Error())
+		}
+		header.Set(match[1], match[2])
+	}
+
+	var bodyAll []byte
+	if *body != "" {
+		bodyAll = []byte(*body)
+	}
+	if *bodyFile != "" {
+		slurp, err := ioutil.ReadFile(*bodyFile)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+		bodyAll = slurp
+	}
+
+	if *output != "csv" && *output != "" {
+		usageAndExit("Invalid output type; only csv is supported.")
+	}
+
+	//Parsing global request proxyAddr.
+	var proxyURL *gurl.URL
+	if *proxyAddr != "" {
+		var err error
+		proxyURL, err = gurl.Parse(*proxyAddr)
+		if err != nil {
+			usageAndExit(err.Error())
+		}
+	}
+	var dialers []proxy.Dialer
+	if *socket5 != "" {
+		var err error
+		dialers, err = parseSocket5(*socket5)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+	}
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		usageAndExit(err.Error())
+	}
+	req.Header = header
+	// set host header if set
+	if *host != "" {
+		req.Host = *host
+	}
+	//Set parameters and global configuration.
+	task := &lbstress.Task{
+		Request:            req,
+		ReqBody:            bodyAll,
+		Number:             *n,
+		Concurrent:         *c,
+		Output:             *output,
+		Timeout:            *t,
+		ThinkTime:          *thinkTime,
+		ProxyAddr:          proxyURL,
+		DisableCompression: *disableCompression,
+		DisableKeepAlives:  *disableKeepalive,
+		DisableRedirects:   *disableRedirects,
+		H2:                 *h2,
+		Dialers:            dialers,
+	}
+	task.Run()
 }
 
-func (t *Task) finish() {
-	close(t.results)
-	if t.Number < 0 {
-		return
+func parseInputWithRegexp(input, regx string) ([]string, error) {
+	re := regexp.MustCompile(regx)
+	matches := re.FindStringSubmatch(input)
+	if len(matches) < 1 {
+		return nil, fmt.Errorf("could not parse the provided input; input = %v", input)
 	}
-	total := time.Now().Sub(t.start) - t.thinkDuration
-	newReport(os.Stdout, t.results, t.Output, total).finalize()
+	return matches, nil
 }
 
-func (t *Task) runRequesters() {
-	dlen := len(t.Dialers)
-	if dlen > 0 {
-		t.Concurrent *= dlen
+type Socket5Config struct {
+	Socket5List []Socket5 `json:"socket5-list"`
+}
+type Socket5 struct {
+	Socket5Type string `json:"socket5-type"`
+	Socket5Addr string `json:"socket5-addr"`
+	Socket5Auth string `json:"socket5-auth"`
+}
+
+func parseSocket5(file string) ([]proxy.Dialer, error) {
+	var socket5Config Socket5Config
+	// path := "C:\\Users\\jia49\\Desktop\\test.json"
+	content, err := ioutil.ReadFile(file)
+	if err != nil {
+		return nil, err
 	}
-	var wg sync.WaitGroup
-	wg.Add(t.Concurrent)
-	for i, j := 0, 0; i < t.Concurrent; i++ {
+	err = json.Unmarshal(content, &socket5Config)
+	if err != nil {
+		return nil, err
+	}
+	dialers := make([]proxy.Dialer, len(socket5Config.Socket5List))
+	for i, config := range socket5Config.Socket5List {
+		// create a socks5 dialer
 		var dialer proxy.Dialer
-		if t.Dialers != nil {
-			dialer = t.Dialers[j]
-			j++
-			if j >= dlen {
-				j = 0
+		if config.Socket5Auth != "" {
+			var username, password string
+			match, err := parseInputWithRegexp(config.Socket5Auth, authRegexp)
+			if err != nil {
+				return nil, err
+			}
+			username, password = match[1], match[2]
+
+			auth := proxy.Auth{
+				User:     username,
+				Password: password,
+			}
+			dialer, err = proxy.SOCKS5(config.Socket5Type, config.Socket5Addr, &auth, proxy.Direct)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			dialer, err = proxy.SOCKS5(config.Socket5Type, config.Socket5Addr, nil, proxy.Direct)
+			if err != nil {
+				return nil, err
 			}
 		}
-		go func(dialer proxy.Dialer) {
-			t.runRequester(t.Number/t.Concurrent, dialer)
-			wg.Done()
-		}(dialer)
+		dialers[i] = dialer
 	}
-	wg.Wait()
+	return dialers, nil
 }
 
-func (t *Task) runRequester(num int, dialer proxy.Dialer) {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DisableCompression: t.DisableCompression,
-		DisableKeepAlives:  t.DisableKeepAlives,
-		Proxy:              http.ProxyURL(t.ProxyAddr),
+func usageAndExit(msg string) {
+	if msg != "" {
+		fmt.Fprintf(os.Stderr, msg)
+		fmt.Fprintf(os.Stderr, "\n\n")
 	}
-	if dialer != nil {
-		transport.Dial = dialer.Dial
-	}
-	if t.H2 {
-		http2.ConfigureTransport(transport)
-	} else {
-		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   time.Duration(t.Timeout) * time.Second,
-	}
-	if t.DisableRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
-	if t.Number < 0 {
-		for {
-			t.sendRequest(client)
-		}
-	} else {
-		for i := 0; i < num; i++ {
-			t.sendRequest(client)
-		}
-	}
+	flag.Usage()
+	fmt.Fprintf(os.Stderr, "\n")
+	os.Exit(1)
 }
 
-func (t *Task) sendRequest(client *http.Client) {
-	var thinkDuration time.Duration
-	start := time.Now()
-	var size int64
-	var code int
-	var dnsStart, connStart, reqStart, resStart, delayStart time.Time
-	var dnsDuration, connDuration, reqDuration, resDuration, delayDuration time.Duration
-	req := cloneRequest(t.Request, t.ReqBody)
-	//Create httptrace.
-	trace := &httptrace.ClientTrace{
-		DNSStart: func(httptrace.DNSStartInfo) {
-			dnsStart = time.Now()
-		},
-		DNSDone: func(httptrace.DNSDoneInfo) {
-			dnsDuration = time.Now().Sub(dnsStart)
-		},
-		GetConn: func(h string) {
-			connStart = time.Now()
-		},
-		GotConn: func(connInfo httptrace.GotConnInfo) {
-			connDuration = time.Now().Sub(connStart)
-			reqStart = time.Now()
-		},
-		WroteRequest: func(w httptrace.WroteRequestInfo) {
-			reqDuration = time.Now().Sub(reqStart)
-			delayStart = time.Now()
-		},
-		GotFirstResponseByte: func() {
-			delayDuration = time.Now().Sub(delayStart)
-			resStart = time.Now()
-		},
-	}
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-	res, err := client.Do(req)
-	if err == nil {
-		size = res.ContentLength
-		code = res.StatusCode
-		io.Copy(ioutil.Discard, res.Body)
-		res.Body.Close()
-	}
-	nowTime := time.Now()
-	resDuration = nowTime.Sub(resStart)
-	end := nowTime.Sub(start)
-	result := &Result{
-		URLStr:        req.URL.String(),
-		Method:        req.Method,
-		Err:           err,
-		StatusCode:    code,
-		Duration:      end,
-		ConnDuration:  connDuration,
-		DNSDuration:   dnsDuration,
-		ReqDuration:   reqDuration,
-		ResDuration:   resDuration,
-		DelayDuration: delayDuration,
-		ContentLength: size,
-	}
-	if t.Number > 0 {
-		t.results <- result
-	}
-	//Handle think time.
-	thinktime := time.Duration(t.ThinkTime) * time.Second
-	time.Sleep(thinktime)
-	thinkDuration += thinktime
-	t.thinkDuration += thinktime
+func errAndExit(msg string) {
+	fmt.Fprintf(os.Stderr, "Error:%s\n", msg)
+	os.Exit(1)
 }
 
-func cloneRequest(r *http.Request, body []byte) *http.Request {
-	req := new(http.Request)
-	*req = *r
-	req.Header = make(http.Header, len(r.Header))
-	for k, s := range r.Header {
-		req.Header[k] = append([]string(nil), s...)
-	}
-	if len(body) > 0 {
-		req.Body = ioutil.NopCloser(bytes.NewReader(body))
-	}
-	return req
+type headerSlice []string
+
+func (h *headerSlice) String() string {
+	return fmt.Sprintf("%s", *h)
 }
 
-// func (t *Task) checkAndInitConfigs() error {
-// 	if t.Number == 0 && t.Duration <= 0 {
-// 		return errors.New("Number or Duration cannot be smaller than 1")
-// 	}
-// 	if t.Number != 0 && t.Duration > 0 {
-// 		return errors.New("Number and Duration only set one")
-// 	}
-// 	if t.Concurrent <= 0 {
-// 		return errors.New("Concurrent cannot be smaller than 1")
-// 	}
-// 	if t.Number > 0 && t.Number < t.Concurrent {
-// 		return errors.New("Number cannot be less than Concurrent")
-// 	}
-// 	if t.Number > 0 && t.Number%t.Concurrent != 0 {
-// 		return errors.New("Number must be an integer multiple of Concurrent")
-// 	}
-// 	if t.Output != "" {
-// 		err := os.MkdirAll(t.Output, 0777)
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-// 	if t.Duration <= 0 && t.Number > 0 {
-// 		t.results = make([]*Result, 0, t.Number)
-// 	}
-// 	for i, n := 0, len(t.reqConfigs); i < n; i++ {
-// 		if t.reqConfigs[i] == nil {
-// 			return errors.New("RequestConfig cannot be nil")
-// 		}
-// 		if t.reqConfigs[i].URLStr == "" || t.reqConfigs[i].Method == "" {
-// 			return errors.New("URLStr and Method cannot be empty")
-// 		}
-// 		if t.Timeout > 0 && t.reqConfigs[i].Timeout <= 0 {
-// 			t.reqConfigs[i].Timeout = t.Timeout
-// 		}
-// 		if t.ThinkTime > 0 && t.reqConfigs[i].ThinkTime <= 0 {
-// 			t.reqConfigs[i].ThinkTime = t.ThinkTime
-// 		}
-// 		if t.Host != "" && t.reqConfigs[i].Host == "" {
-// 			t.reqConfigs[i].Host = t.Host
-// 		}
-// 		if t.ProxyAddr != nil && t.reqConfigs[i].ProxyAddr == nil {
-// 			t.reqConfigs[i].ProxyAddr = t.ProxyAddr
-// 		}
-// 		if t.DisableCompression && !t.reqConfigs[i].DisableCompression {
-// 			t.reqConfigs[i].DisableCompression = true
-// 		}
-// 		if t.DisableKeepAlives && !t.reqConfigs[i].DisableKeepAlives {
-// 			t.reqConfigs[i].DisableKeepAlives = true
-// 		}
-// 		if t.DisableRedirects && !t.reqConfigs[i].DisableRedirects {
-// 			t.reqConfigs[i].DisableRedirects = true
-// 		}
-// 		t.reqConfigs[i].Method = strings.ToUpper(t.reqConfigs[i].Method)
-// 		req, err := http.NewRequest(t.reqConfigs[i].Method, t.reqConfigs[i].URLStr, nil)
-// 		if err != nil {
-// 			return err
-// 		}
-// 		if t.reqConfigs[i].Header != nil {
-// 			req.Header = t.reqConfigs[i].Header
-// 		}
-// 		t.reqConfigs[i].request = req
-// 	}
-
-// 	return nil
-// }
+func (h *headerSlice) Set(value string) error {
+	*h = append(*h, value)
+	return nil
+}
