@@ -14,6 +14,9 @@ import (
 	"sync"
 	"time"
 
+	// "github.com/gamexg/proxyclient"
+	// "stress/stress/proxyclient"
+
 	"golang.org/x/net/proxy"
 
 	"golang.org/x/net/http2"
@@ -236,23 +239,39 @@ func (t *Task) runTCPRequester(num int, socketConfig *Socket5) {
 }
 
 func (t *Task) sendTCP(socketConfig *Socket5) {
-	var localAddr *net.TCPAddr
+	var conn net.Conn
+	var err error
 	if socketConfig != nil {
-		var err error
-		localAddr, err = net.ResolveTCPAddr("tcp4", socketConfig.Socket5Addr)
+		var user, pwd string
+		if socketConfig.Socket5Auth != nil {
+			user, pwd = socketConfig.Socket5Auth.User, socketConfig.Socket5Auth.Password
+		}
+		// var err error
+		// localAddr, err = net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%s@%s", user, pwd, socketConfig.Socket5Addr))
+		// if err != nil {
+		// 	fmt.Println(err)
+		// 	return
+		// }
+		proxy, err := newSocksProxyClient("socks5", socketConfig.Socket5Addr, user, pwd, nil, nil)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
+		conn, err = proxy.Dial("tcp", socketConfig.Socket5Addr)
+	} else {
+		tcpAddr, err := net.ResolveTCPAddr("tcp4", t.TCPAddr)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		conn, err = net.DialTCP("tcp", nil, tcpAddr)
 	}
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", t.TCPAddr)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	conn, err := net.DialTCP("tcp", localAddr, tcpAddr)
-	if err != nil {
-		fmt.Println(err)
+	if conn == nil {
+		fmt.Println("conn is nil")
 		return
 	}
 	for _, data := range t.TCPData {
