@@ -63,7 +63,19 @@ Options:
 -tcp-interval 50        Default packet interval:50ms
 -tcp-data .\730i.txt    Specify the packet path, hexadecimal
 -tcp                    -tcp 19.63.46.244:800
+-socket5                -socket5 test.json
 ```
+
+test.json
+{
+	"socket5-list":[
+		{
+			"socket5-type":"tcp",
+			"socket5-addr":"92.244.200.13:35923",
+			"socket5-auth":"1234:4321"
+		}
+	]
+}
 
 For example: run a task.
 
