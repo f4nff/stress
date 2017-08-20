@@ -1,23 +1,27 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	gurl "net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	lbstress "github.com/wenjiax/stress/stress"
+	"golang.org/x/net/proxy"
+
+	lbstress "stress/stress"
 )
 
 var (
-	m = flag.String("m", "GET", "")
-	// headers  = flag.String("h", "", "")
+	m        = flag.String("m", "GET", "")
 	body     = flag.String("b", "", "")
 	bodyFile = flag.String("B", "", "")
 
@@ -25,21 +29,26 @@ var (
 	proxyAddr = flag.String("x", "", "")
 	host      = flag.String("host", "", "")
 
-	n         = flag.Int("n", 100, "")
-	c         = flag.Int("c", 10, "")
-	t         = flag.Int("t", 20, "")
-	d         = flag.Int("d", 0, "")
-	thinkTime = flag.Int("think-time", 0, "")
+	n             = flag.Int("n", 100, "")
+	c             = flag.Int("c", 10, "")
+	t             = flag.Int("t", 20, "")
+	thinkTime     = flag.Int("think-time", 0, "")
+	sendThinkTime = flag.Int("send-think-time", 0, "")
 
 	h2                 = flag.Bool("h2", false, "")
 	disableCompression = flag.Bool("disable-compression", false, "")
 	disableKeepalive   = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
-	enableTran         = flag.Bool("enable-tran", false, "")
+
+	socket5     = flag.String("socket5", "", "")
+	tcp         = flag.String("tcp", "", "")
+	tcpData     = flag.String("tcp-data", "", "")
+	tcpInterval = flag.Int("tcp-interval", 50, "")
 )
 
 const (
 	headerRegexp = `^([\w-]+):\s*(.+)`
+	authRegexp   = `^(.+):([^\s].+)`
 
 	methodsRegexp   = `m:([a-zA-Z]+),*`
 	bodyRegexp      = `b:([^,]+),*`
@@ -48,7 +57,7 @@ const (
 	thinkTimeRegexp = `thinkTime:([\d]+),*`
 )
 
-var usage = `Usage: stress [options...] <url> || stress [options...] -enable-tran <urls...>
+var usage = `Usage: stress [options...] <url> 
 
 Options:
   -n  Number of requests to run. Default value is 100.
@@ -57,8 +66,9 @@ Options:
   -c  Number of requests to run concurrently. 
       Total number of requests cannot smaller than the concurrency level. 
       Default value is 10.
-  -d  Duration of requests to run. Default value is 0 sec.
-  -o  Output file path. For example: /home/user or ./files.
+  -o  Output type. If none provided, a summary is printed.
+      "csv" is the only supported alternative. Dumps the response
+      metrics in comma-separated values format.
   
   -h  Custom HTTP header. For example: 
       -h "Accept: text/html" -h "Content-Type: application/xml".
@@ -72,18 +82,18 @@ Options:
 
   -h2 	 Enable HTTP/2.
   -host	 Set HTTP Host header.
+
+  -tcp                  
+  -tcp-data
+  -tcp-interval
   
+  -socket5              Set Socket5 config from file.For example:
+                        /home/user/socket5.json or ./socket5.json.
   -think-time           Time to think after request. Default value is 0 sec.
   -disable-compression  Disable compression.
   -disable-keepalive    Disable keep-alive, prevents re-use of TCP
                     	connections between different HTTP requests.
   -disable-redirects    Disable following of HTTP redirects.
-  -enable-tran          Enable transactional requests. Multiple urls 
-                        form a transactional requests. 
-                        For example: "stress [options...] -enable-tran 
-                        http://localhost:8080,m:post,b:hi,x:http://127.0.0.1:8888 
-                        http://localhost:8888,m:post,B:/home/file.txt,thinkTime:2 
-                        [urls...]".
 `
 
 func main() {
@@ -93,12 +103,66 @@ func main() {
 	var hs headerSlice
 	flag.Var(&hs, "h", "")
 	flag.Parse()
-	if flag.NArg() <= 0 {
-		usageAndExit("")
+	if *tcp == "" {
+		if flag.NArg() <= 0 {
+			usageAndExit("")
+		}
 	}
+	num := *n
+	conc := *c
+	if num == 0 {
+		usageAndExit("-n cannot be smaller than 1")
+	}
+	if conc <= 0 {
+		usageAndExit("-c cannot be smaller than 1.")
+	}
+	if num > 0 && num < conc {
+		usageAndExit("-n cannot be less than -c.")
+	}
+	var socket5s []*lbstress.Socket5
+	if *socket5 != "" {
+		var err error
+		socket5s, err = parseSocket5(*socket5)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+	}
+	if *tcp != "" {
+		tcpAddr, err := net.ResolveTCPAddr("tcp4", *tcp)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+
+		conn, err := net.DialTCP("tcp", nil, tcpAddr)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+		conn.Close()
+		var datas [][]byte
+		if *tcpData != "" {
+			var err error
+			datas, err = parseFileData(*tcpData)
+			if err != nil {
+				errAndExit(err.Error())
+			}
+		}
+
+		task := lbstress.Task{
+			TCPData:     datas,
+			Number:      *n,
+			Concurrent:  *c,
+			TCPInterval: *tcpInterval,
+			TCPAddr:     *tcp,
+			Socket5List: socket5s,
+		}
+		task.Run()
+		return
+	}
+	url := flag.Args()[0]
+	method := strings.ToUpper(*m)
+
 	//Parsing global request header.
 	header := make(http.Header)
-	// hs := strings.Split(*headers, ";")
 	for _, h := range hs {
 		match, err := parseInputWithRegexp(h, headerRegexp)
 		if err != nil {
@@ -106,6 +170,23 @@ func main() {
 		}
 		header.Set(match[1], match[2])
 	}
+
+	var bodyAll []byte
+	if *body != "" {
+		bodyAll = []byte(*body)
+	}
+	if *bodyFile != "" {
+		slurp, err := ioutil.ReadFile(*bodyFile)
+		if err != nil {
+			errAndExit(err.Error())
+		}
+		bodyAll = slurp
+	}
+
+	if *output != "csv" && *output != "" {
+		usageAndExit("Invalid output type; only csv is supported.")
+	}
+
 	//Parsing global request proxyAddr.
 	var proxyURL *gurl.URL
 	if *proxyAddr != "" {
@@ -115,11 +196,21 @@ func main() {
 			usageAndExit(err.Error())
 		}
 	}
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		usageAndExit(err.Error())
+	}
+	req.Header = header
+	// set host header if set
+	if *host != "" {
+		req.Host = *host
+	}
 	//Set parameters and global configuration.
 	task := &lbstress.Task{
+		Request:            req,
+		ReqBody:            bodyAll,
 		Number:             *n,
 		Concurrent:         *c,
-		Duration:           time.Duration(*d) * time.Second,
 		Output:             *output,
 		Timeout:            *t,
 		ThinkTime:          *thinkTime,
@@ -127,96 +218,10 @@ func main() {
 		DisableCompression: *disableCompression,
 		DisableKeepAlives:  *disableKeepalive,
 		DisableRedirects:   *disableRedirects,
-		Host:               *host,
 		H2:                 *h2,
+		Socket5List:        socket5s,
 	}
-	if *enableTran {
-		runTran(task, header)
-	} else {
-		run(task, header)
-	}
-
-}
-
-func run(task *lbstress.Task, header http.Header) {
-	//Parsing request body.
-	var bodyAll []byte
-	if *body != "" {
-		bodyAll = []byte(*body)
-	}
-	if *bodyFile != "" {
-		content, err := ioutil.ReadFile(*bodyFile)
-		if err != nil {
-			errAndExit(err.Error())
-		}
-		bodyAll = content
-	}
-	//Run task.
-	err := task.Run(&lbstress.RequestConfig{
-		URLStr:  flag.Args()[0],
-		Method:  *m,
-		ReqBody: bodyAll,
-		Header:  header,
-	})
-	if err != nil {
-		errAndExit(err.Error())
-	}
-}
-
-func runTran(task *lbstress.Task, header http.Header) {
-	var configs []*lbstress.RequestConfig
-	for i, len := 0, flag.NArg(); i < len; i++ {
-		argstr := flag.Args()[i]
-		url := strings.Split(argstr, ",")[0]
-		//Parsing request method.
-		methodMatch, err := parseInputWithRegexp(argstr, methodsRegexp)
-		if err != nil {
-			errAndExit(err.Error())
-		}
-		//Parsing request body.
-		bodyMatch, _ := parseInputWithRegexp(argstr, bodyRegexp)
-		bodyFileMatch, _ := parseInputWithRegexp(argstr, bodyFileRegexp)
-		var bodyAll []byte
-		if bodyMatch != nil {
-			bodyAll = []byte(bodyMatch[1])
-		}
-		if bodyFileMatch != nil {
-			content, err := ioutil.ReadFile(bodyFileMatch[1])
-			if err != nil {
-				errAndExit(err.Error())
-			}
-			bodyAll = content
-		}
-		//Parsing request proxyAddr.
-		proxyAddrMatch, _ := parseInputWithRegexp(argstr, proxyAddrRegexp)
-		var proxyURL *gurl.URL
-		if proxyAddrMatch != nil {
-			var err error
-			proxyURL, err = gurl.Parse(*proxyAddr)
-			if err != nil {
-				usageAndExit(err.Error())
-			}
-		}
-		//Parsing request thinkTime.
-		thinkTime := 0
-		thinkTimeMatch, _ := parseInputWithRegexp(argstr, thinkTimeRegexp)
-		if thinkTimeMatch != nil {
-			thinkTime, _ = strconv.Atoi(thinkTimeMatch[1])
-		}
-		configs = append(configs, &lbstress.RequestConfig{
-			URLStr:    url,
-			Method:    methodMatch[1],
-			ReqBody:   bodyAll,
-			Header:    header,
-			ProxyAddr: proxyURL,
-			ThinkTime: thinkTime,
-		})
-	}
-	//Run transactional task.
-	err := task.RunTran(configs...)
-	if err != nil {
-		errAndExit(err.Error())
-	}
+	task.Run()
 }
 
 func parseInputWithRegexp(input, regx string) ([]string, error) {
@@ -226,6 +231,82 @@ func parseInputWithRegexp(input, regx string) ([]string, error) {
 		return nil, fmt.Errorf("could not parse the provided input; input = %v", input)
 	}
 	return matches, nil
+}
+
+type Socket5Config struct {
+	Socket5List []Socket5 `json:"socket5-list"`
+}
+type Socket5 struct {
+	Socket5Type string `json:"socket5-type"`
+	Socket5Addr string `json:"socket5-addr"`
+	Socket5Auth string `json:"socket5-auth"`
+}
+
+func parseSocket5(file string) ([]*lbstress.Socket5, error) {
+	var socket5Config Socket5Config
+	content, err := ioutil.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(content, &socket5Config)
+	if err != nil {
+		return nil, err
+	}
+	var configs []*lbstress.Socket5
+	for _, config := range socket5Config.Socket5List {
+		var socketConfig lbstress.Socket5
+		if config.Socket5Auth != "" {
+			var username, password string
+			match, err := parseInputWithRegexp(config.Socket5Auth, authRegexp)
+			if err != nil {
+				return nil, err
+			}
+			username, password = match[1], match[2]
+
+			auth := proxy.Auth{
+				User:     username,
+				Password: password,
+			}
+			socketConfig.Socket5Auth = &auth
+		}
+		socketConfig.Socket5Addr = config.Socket5Addr
+		socketConfig.Socket5Type = config.Socket5Type
+		configs = append(configs, &socketConfig)
+	}
+	return configs, nil
+}
+
+func parseFileData(file string) ([][]byte, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	var datas [][]byte
+	buf := bufio.NewReader(f)
+	for {
+		line, err := buf.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		line = strings.TrimSpace(line)
+		var data []byte
+	ESCA:
+		if line != "" {
+			var val rune
+			var err error
+			val, _, line, err = strconv.UnquoteChar(line, 0)
+			if err != nil {
+				return nil, err
+			}
+			data = append(data, byte(val))
+			goto ESCA
+		}
+		datas = append(datas, data)
+	}
+	return datas, nil
 }
 
 func usageAndExit(msg string) {
