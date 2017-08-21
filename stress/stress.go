@@ -11,11 +11,9 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"stress/stress/proxyclient"
 	"sync"
 	"time"
-
-	// "github.com/gamexg/proxyclient"
-	// "stress/stress/proxyclient"
 
 	"golang.org/x/net/proxy"
 
@@ -246,20 +244,16 @@ func (t *Task) sendTCP(socketConfig *Socket5) {
 		if socketConfig.Socket5Auth != nil {
 			user, pwd = socketConfig.Socket5Auth.User, socketConfig.Socket5Auth.Password
 		}
-		// var err error
-		// localAddr, err = net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%s@%s", user, pwd, socketConfig.Socket5Addr))
-		// if err != nil {
-		// 	fmt.Println(err)
-		// 	return
-		// }
-		proxy, err := newSocksProxyClient("socks5", socketConfig.Socket5Addr, user, pwd, nil, nil)
+		var proxy proxyclient.ProxyClient
+		proxy, err = proxyclient.NewSocksProxyClient("socks5", socketConfig.Socket5Addr, user, pwd, nil, nil)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 		conn, err = proxy.Dial("tcp", socketConfig.Socket5Addr)
 	} else {
-		tcpAddr, err := net.ResolveTCPAddr("tcp4", t.TCPAddr)
+		var tcpAddr *net.TCPAddr
+		tcpAddr, err = net.ResolveTCPAddr("tcp4", t.TCPAddr)
 		if err != nil {
 			fmt.Println(err)
 			return

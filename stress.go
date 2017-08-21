@@ -103,11 +103,14 @@ func main() {
 	var hs headerSlice
 	flag.Var(&hs, "h", "")
 	flag.Parse()
+
+	//判断是否为TCP请求
 	if *tcp == "" {
 		if flag.NArg() <= 0 {
 			usageAndExit("")
 		}
 	}
+	//校验请求数和并发数
 	num := *n
 	conc := *c
 	if num == 0 {
@@ -119,6 +122,7 @@ func main() {
 	if num > 0 && num < conc {
 		usageAndExit("-n cannot be less than -c.")
 	}
+	//转换socket5代理配置
 	var socket5s []*lbstress.Socket5
 	if *socket5 != "" {
 		var err error
@@ -127,7 +131,9 @@ func main() {
 			errAndExit(err.Error())
 		}
 	}
+	//判断是否为TCP请求
 	if *tcp != "" {
+		//校验TCP参数
 		tcpAddr, err := net.ResolveTCPAddr("tcp4", *tcp)
 		if err != nil {
 			errAndExit(err.Error())
@@ -138,6 +144,7 @@ func main() {
 			errAndExit(err.Error())
 		}
 		conn.Close()
+		//转换TCP发送的数据
 		var datas [][]byte
 		if *tcpData != "" {
 			var err error
@@ -146,7 +153,7 @@ func main() {
 				errAndExit(err.Error())
 			}
 		}
-
+		//请求TCP
 		task := lbstress.Task{
 			TCPData:     datas,
 			Number:      *n,
@@ -293,16 +300,20 @@ func parseFileData(file string) ([][]byte, error) {
 		}
 		line = strings.TrimSpace(line)
 		var data []byte
-	ESCA:
-		if line != "" {
-			var val rune
-			var err error
-			val, _, line, err = strconv.UnquoteChar(line, 0)
-			if err != nil {
-				return nil, err
+		if strconv.CanBackquote(line) {
+		ESCA:
+			if line != "" {
+				var val rune
+				var err error
+				val, _, line, err = strconv.UnquoteChar(line, 0)
+				if err != nil {
+					return nil, err
+				}
+				data = append(data, byte(val))
+				goto ESCA
 			}
-			data = append(data, byte(val))
-			goto ESCA
+		} else {
+			data = []byte(line)
 		}
 		datas = append(datas, data)
 	}
