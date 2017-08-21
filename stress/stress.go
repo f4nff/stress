@@ -11,6 +11,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"os/signal"
 	"stress/stress/proxyclient"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ type (
 		thinkDuration time.Duration
 		start         time.Time
 		results       chan *Result
+		isStop        bool
 	}
 )
 
@@ -66,6 +68,14 @@ type Socket5 struct {
 
 //Run is run a task.
 func (t *Task) Run() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		t.finish()
+		os.Exit(1)
+	}()
+
 	if t.Number > 0 && t.TCPAddr == "" {
 		t.results = make(chan *Result, t.Number)
 	}
@@ -77,6 +87,7 @@ func (t *Task) Run() {
 func (t *Task) finish() {
 	if t.TCPAddr == "" {
 		close(t.results)
+		t.isStop = true
 		if t.Number < 0 {
 			return
 		}
@@ -214,7 +225,7 @@ func (t *Task) sendRequest(client *http.Client) {
 		DelayDuration: delayDuration,
 		ContentLength: size,
 	}
-	if t.Number > 0 {
+	if t.Number > 0 && !t.isStop {
 		t.results <- result
 	}
 	//Handle think time.
