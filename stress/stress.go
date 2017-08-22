@@ -76,6 +76,13 @@ func (t *Task) Run() {
 		os.Exit(1)
 	}()
 
+	dlen := len(t.Socket5List)
+	if dlen > 0 {
+		t.Concurrent *= dlen
+		if t.Number > 0 {
+			t.Number *= dlen
+		}
+	}
 	if t.Number > 0 && t.TCPAddr == "" {
 		t.results = make(chan *Result, t.Number)
 	}
@@ -86,8 +93,10 @@ func (t *Task) Run() {
 
 func (t *Task) finish() {
 	if t.TCPAddr == "" {
-		close(t.results)
-		t.isStop = true
+		if !t.isStop && t.Number > 0 {
+			close(t.results)
+			t.isStop = true
+		}
 		if t.Number < 0 {
 			return
 		}
@@ -98,9 +107,6 @@ func (t *Task) finish() {
 
 func (t *Task) runRequesters() {
 	dlen := len(t.Socket5List)
-	if dlen > 0 {
-		t.Concurrent *= dlen
-	}
 	var wg sync.WaitGroup
 	wg.Add(t.Concurrent)
 	for i, j := 0, 0; i < t.Concurrent; i++ {
@@ -208,6 +214,8 @@ func (t *Task) sendRequest(client *http.Client) {
 		code = res.StatusCode
 		io.Copy(ioutil.Discard, res.Body)
 		res.Body.Close()
+	} else {
+		fmt.Println(err)
 	}
 	nowTime := time.Now()
 	resDuration = nowTime.Sub(resStart)
