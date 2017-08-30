@@ -1,24 +1,9 @@
 {
-	"socket5-list":[
+	"socket-list":[
 		{
-			"socket5-type":"tcp",
-			"socket5-addr":"127.0.0.1:9999",
-			"socket5-auth":"1234:4321"
-		},
-		{
-			"socket5-type":"tcp",
-			"socket5-addr":"127.0.0.1:1132",
-			"socket5-auth":"1234:4321"
-		},
-		{
-			"socket5-type":"tcp",
-			"socket5-addr":"127.0.0.1:8888",
-			"socket5-auth":"1234:4321"
-		},
-		{
-			"socket5-type":"tcp",
-			"socket5-addr":"127.0.0.1:7777",
-			"socket5-auth":"1234:4321"
+			"socket-type":"socks4",
+			"socket-addr":"192.168.2.151:10999",
+			"socket-auth":"1234:4321"
 		}
 	]
 }

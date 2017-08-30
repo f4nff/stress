@@ -155,14 +155,14 @@ func (p *socksProxyClient) DialTCPSAddrTimeout(network string, raddr string, tim
 			return
 		}
 
-		_, _, _, _, _, cerr := socksRecvCmdResponse(c, p)
-		if cerr != nil {
-			closed = true
-			c.Close()
-			rerr = fmt.Errorf("请求代理服务器建立连接失败：%v", err)
-			ch <- 0
-			return
-		}
+//		_, _, _, _, _, cerr := socksRecvCmdResponse(c, p)
+//		if cerr != nil {
+//			closed = true
+//			c.Close()
+//			rerr = fmt.Errorf("请求代理服务器建立连接失败：%v", err)
+//			ch <- 0
+//			return
+//		}
 
 		r := socksTCPConn{ProxyTCPConn: c, proxyClient: p} //{c,net.ResolveTCPAddr("tcp","0.0.0.0:0"),net.ResolveTCPAddr("tcp","0.0.0.0:0"),"","",0,0  p}
 
@@ -364,6 +364,7 @@ func socksSendCmdRequest(w io.Writer, p *socksProxyClient, cmd byte, raddr strin
 		b = append(b, portByte...)
 		// ip
 		b = append(b, []byte(ip)...)
+		b = append(b, 0x00)
 	} else {
 		return fmt.Errorf("未知的 socks 代理类型：%v", p.proxyType)
 	}
