@@ -60,22 +60,26 @@ Options:
                         http://localhost:8080,m:post,b:hi,x:http://127.0.0.1:8888 
                         http://localhost:8888,m:post,B:/home/file.txt,thinkTime:2 
                         [urls...]".
--tcp-interval 50        Default packet interval:50ms
--tcp-data .\730i.txt    Specify the packet path, hexadecimal
--tcp                    -tcp 19.63.46.244:800
--socket5                -socket5 test.json
-```
+-tcp
+-send-data                    Hexadecimal packet
+-tcp-interval                 Packet interval delay
+
+-socket-proxy-file    Set Socket config from file.For example:
+                      /home/user/Socket.json or ./Socket.json.
+
 
 test.json
 {
-	"socket5-list":[
+	"socket-list":[
 		{
-			"socket5-type":"tcp",
-			"socket5-addr":"92.244.200.13:35923",
-			"socket5-auth":"1234:4321"
+			"socket-type":"socks4",
+			"socket-addr":"192.168.2.151:10999",
+			"socket-auth":"1234:4321"
 		}
 	]
 }
+
+stress -n 2 -c 1 -send-data "730i.txt" -socket-proxy-file "test.json"  -send-interval 50 -tcp 198.181.32.236:9003
 
 For example: run a task.
 
