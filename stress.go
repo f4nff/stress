@@ -85,10 +85,10 @@ Options:
   -host	 Set HTTP Host header.
 
   -tcp                  
-  -send-data			Hexadecimal packet
-  -tcp-interval			Packet interval delay
+  -tcp-data
+  -tcp-interval
   
-  -socket-proxy-file    Set Socket config from file.For example:
+  -Socket              Set Socket config from file.For example:
                         /home/user/Socket.json or ./Socket.json.
   -think-time           Time to think after request. Default value is 0 sec.
   -disable-compression  Disable compression.
@@ -301,12 +301,18 @@ func parseSocket(file string) ([]*lbstress.Socket, error) {
 		var socketConfig lbstress.Socket
 		if config.SocketAuth != "" {
 			var username, password string
-			match, err := parseInputWithRegexp(config.SocketAuth, authRegexp)
-			if err != nil {
-				return nil, err
+			// match, err := parseInputWithRegexp(config.SocketAuth, authRegexp)
+			// if err != nil {
+			// 	return nil, err
+			// }
+			match := strings.Split(config.SocketAuth, ":")
+			matchLen := len(match)
+			if matchLen == 2 {
+				username, password = match[0], match[1]
 			}
-			username, password = match[1], match[2]
-
+			if matchLen == 1 {
+				username = match[0]
+			}
 			auth := proxy.Auth{
 				User:     username,
 				Password: password,

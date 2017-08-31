@@ -144,7 +144,8 @@ func (t *Task) runRequester(num int, socketConfig *Socket) {
 		Proxy:              http.ProxyURL(t.ProxyAddr),
 	}
 	if socketConfig != nil {
-		dialer, err := proxy.SOCKS5(socketConfig.SocketType, socketConfig.SocketAddr, socketConfig.SocketAuth, proxy.Direct)
+		// socketConfig.SocketType
+		dialer, err := proxy.SOCKS5("tcp", socketConfig.SocketAddr, socketConfig.SocketAuth, proxy.Direct)
 		if err != nil {
 			fmt.Println(err)
 		} else {
