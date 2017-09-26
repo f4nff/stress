@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	lbstress "stress/stress"
+	lbstress "github.com/f4nff/stress/stress"
 )
 
 var (
@@ -40,10 +40,11 @@ var (
 	disableKeepalive   = flag.Bool("disable-keepalive", false, "")
 	disableRedirects   = flag.Bool("disable-redirects", false, "")
 
-	socket5     = flag.String("socket5", "", "")
-	tcp         = flag.String("tcp", "", "")
-	tcpData     = flag.String("tcp-data", "", "")
-	tcpInterval = flag.Int("tcp-interval", 50, "")
+	socket = flag.String("socket-proxy-file", "", "")
+	tcp    = flag.String("tcp", "", "")
+	// udp          = flag.String("udp", "", "")
+	sendData     = flag.String("send-data", "", "")
+	sendInterval = flag.Int("send-interval", 50, "")
 )
 
 const (
@@ -84,17 +85,20 @@ Options:
   -host	 Set HTTP Host header.
 
   -tcp                  
-  -tcp-data
+  -send-data
   -tcp-interval
   
-  -socket5              Set Socket5 config from file.For example:
-                        /home/user/socket5.json or ./socket5.json.
+  -socket-proxy-file    Set Socket config from file.For example:
+                        /home/user/Socket.json or ./Socket.json.
   -think-time           Time to think after request. Default value is 0 sec.
   -disable-compression  Disable compression.
   -disable-keepalive    Disable keep-alive, prevents re-use of TCP
                     	connections between different HTTP requests.
   -disable-redirects    Disable following of HTTP redirects.
+  stress -n 10 -c 1 -socket-proxy-file "test.json"  -m GET http://198.181.32.236
+  stress -n 1 -c 1 -send-data  "11.txt" -socket-proxy-file "test.json" -send-interval 100 -tcp 198.181.32.236:9003
 `
+
 
 func main() {
 	flag.Usage = func() {
@@ -105,6 +109,7 @@ func main() {
 	flag.Parse()
 
 	//判断是否为TCP请求
+	//  && *udp == ""
 	if *tcp == "" {
 		if flag.NArg() <= 0 {
 			usageAndExit("")
@@ -122,11 +127,11 @@ func main() {
 	if num > 0 && num < conc {
 		usageAndExit("-n cannot be less than -c.")
 	}
-	//转换socket5代理配置
-	var socket5s []*lbstress.Socket5
-	if *socket5 != "" {
+	//转换Socket代理配置
+	var sockets []*lbstress.Socket
+	if *socket != "" {
 		var err error
-		socket5s, err = parseSocket5(*socket5)
+		sockets, err = parseSocket(*socket)
 		if err != nil {
 			errAndExit(err.Error())
 		}
@@ -146,25 +151,60 @@ func main() {
 		conn.Close()
 		//转换TCP发送的数据
 		var datas [][]byte
-		if *tcpData != "" {
+		if *sendData != "" {
 			var err error
-			datas, err = parseFileData(*tcpData)
+			datas, err = parseFileData(*sendData)
 			if err != nil {
 				errAndExit(err.Error())
 			}
 		}
 		//请求TCP
 		task := lbstress.Task{
-			TCPData:     datas,
-			Number:      *n,
-			Concurrent:  *c,
-			TCPInterval: *tcpInterval,
-			TCPAddr:     *tcp,
-			Socket5List: socket5s,
+			SendData:     datas,
+			Number:       *n,
+			Concurrent:   *c,
+			SendInterval: *sendInterval,
+			SocketAddr:   *tcp,
+			SocketType:   "tcp",
+			SocketList:   sockets,
 		}
 		task.Run()
 		return
 	}
+	// //判断是否为UDP请求
+	// if *udp != "" {
+	// 	//校验TCP参数
+	// 	udpAddr, err := net.ResolveUDPAddr("udp4", *udp)
+	// 	if err != nil {
+	// 		errAndExit(err.Error())
+	// 	}
+	// 	conn, err := net.DialUDP("udp", nil, udpAddr)
+	// 	if err != nil {
+	// 		errAndExit(err.Error())
+	// 	}
+	// 	conn.Close()
+	// 	//转换TCP发送的数据
+	// 	var datas [][]byte
+	// 	if *sendData != "" {
+	// 		var err error
+	// 		datas, err = parseFileData(*sendData)
+	// 		if err != nil {
+	// 			errAndExit(err.Error())
+	// 		}
+	// 	}
+	// 	//请求UDP
+	// 	task := lbstress.Task{
+	// 		SendData:     datas,
+	// 		Number:       *n,
+	// 		Concurrent:   *c,
+	// 		SendInterval: *sendInterval,
+	// 		SocketAddr:   *udp,
+	// 		SocketType:   "udp",
+	// 		SocketList:   sockets,
+	// 	}
+	// 	task.Run()
+	// 	return
+	// }
 	url := flag.Args()[0]
 	method := strings.ToUpper(*m)
 
@@ -226,7 +266,7 @@ func main() {
 		DisableKeepAlives:  *disableKeepalive,
 		DisableRedirects:   *disableRedirects,
 		H2:                 *h2,
-		Socket5List:        socket5s,
+		SocketList:         sockets,
 	}
 	task.Run()
 }
@@ -240,44 +280,50 @@ func parseInputWithRegexp(input, regx string) ([]string, error) {
 	return matches, nil
 }
 
-type Socket5Config struct {
-	Socket5List []Socket5 `json:"socket5-list"`
+type SocketConfig struct {
+	SocketList []Socket `json:"socket-list"`
 }
-type Socket5 struct {
-	Socket5Type string `json:"socket5-type"`
-	Socket5Addr string `json:"socket5-addr"`
-	Socket5Auth string `json:"socket5-auth"`
+type Socket struct {
+	SocketType string `json:"socket-type"`
+	SocketAddr string `json:"socket-addr"`
+	SocketAuth string `json:"socket-auth"`
 }
 
-func parseSocket5(file string) ([]*lbstress.Socket5, error) {
-	var socket5Config Socket5Config
+func parseSocket(file string) ([]*lbstress.Socket, error) {
+	var SocketConfig SocketConfig
 	content, err := ioutil.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(content, &socket5Config)
+	err = json.Unmarshal(content, &SocketConfig)
 	if err != nil {
 		return nil, err
 	}
-	var configs []*lbstress.Socket5
-	for _, config := range socket5Config.Socket5List {
-		var socketConfig lbstress.Socket5
-		if config.Socket5Auth != "" {
+	var configs []*lbstress.Socket
+	for _, config := range SocketConfig.SocketList {
+		var socketConfig lbstress.Socket
+		if config.SocketAuth != "" {
 			var username, password string
-			match, err := parseInputWithRegexp(config.Socket5Auth, authRegexp)
-			if err != nil {
-				return nil, err
+			// match, err := parseInputWithRegexp(config.SocketAuth, authRegexp)
+			// if err != nil {
+			// 	return nil, err
+			// }
+			match := strings.Split(config.SocketAuth, ":")
+			matchLen := len(match)
+			if matchLen == 2 {
+				username, password = match[0], match[1]
 			}
-			username, password = match[1], match[2]
-
+			if matchLen == 1 {
+				username = match[0]
+			}
 			auth := proxy.Auth{
 				User:     username,
 				Password: password,
 			}
-			socketConfig.Socket5Auth = &auth
+			socketConfig.SocketAuth = &auth
 		}
-		socketConfig.Socket5Addr = config.Socket5Addr
-		socketConfig.Socket5Type = config.Socket5Type
+		socketConfig.SocketAddr = config.SocketAddr
+		socketConfig.SocketType = config.SocketType
 		configs = append(configs, &socketConfig)
 	}
 	return configs, nil

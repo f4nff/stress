@@ -159,7 +159,7 @@ func (p *socksProxyClient) DialTCPSAddrTimeout(network string, raddr string, tim
 		if cerr != nil {
 			closed = true
 			c.Close()
-			rerr = fmt.Errorf("请求代理服务器建立连接失败：%v", err)
+			rerr = fmt.Errorf("请求代理服务器建立连接失败：%v", cerr)
 			ch <- 0
 			return
 		}
@@ -364,6 +364,7 @@ func socksSendCmdRequest(w io.Writer, p *socksProxyClient, cmd byte, raddr strin
 		b = append(b, portByte...)
 		// ip
 		b = append(b, []byte(ip)...)
+		b = append(b, 0x00)
 	} else {
 		return fmt.Errorf("未知的 socks 代理类型：%v", p.proxyType)
 	}
@@ -382,25 +383,25 @@ func socksRecvCmdResponse(r io.Reader, p *socksProxyClient) (rep int, dstAddr st
 	b := make([]byte, 255+10)
 	if p.proxyType == "socks4" || p.proxyType == "socks4a" {
 		//ver
-		if _, cerr := io.ReadFull(r, b[:1]); cerr != nil || b[0] != 0x04 {
-			err = fmt.Errorf("socks4代理服务器 命令响应错误，ver=%v", b[0])
-			return
-		}
+		// if _, cerr := io.ReadFull(r, b[:1]); cerr != nil || b[0] != 0x04 {
+		// 	err = fmt.Errorf("socks4代理服务器 命令响应错误，ver=%v", b[0])
+		// 	return
+		// }
 
-		// cmd、 dst port、dst ip
-		if _, cerr := io.ReadFull(r, b[:7]); cerr != nil {
-			err = fmt.Errorf("IO 读取错误，详细信息：%v", cerr)
-			return
-		}
+		// // cmd、 dst port、dst ip
+		// if _, cerr := io.ReadFull(r, b[:7]); cerr != nil {
+		// 	err = fmt.Errorf("IO 读取错误，详细信息：%v", cerr)
+		// 	return
+		// }
 
-		rep = int(b[0])
-		if rep != 90 {
-			err = fmt.Errorf("远程代理无法连接到目标。rep=%v", rep)
-		}
+		// rep = int(b[0])
+		// if rep != 90 {
+		// 	err = fmt.Errorf("远程代理无法连接到目标。rep=%v", rep)
+		// }
 
-		dstPort = binary.BigEndian.Uint16(b[1:3])
-		dstIP := net.IP(b[3 : 3+4])
-		dstAddr = dstIP.String()
+		// dstPort = binary.BigEndian.Uint16(b[1:3])
+		// dstIP := net.IP(b[3 : 3+4])
+		// dstAddr = dstIP.String()
 
 		return
 	} else if p.proxyType == "socks5" {

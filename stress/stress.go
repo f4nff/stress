@@ -12,7 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"stress/stress/proxyclient"
+	"github.com/f4nff/stress/stress/proxyclient"
 	"sync"
 	"time"
 
@@ -38,11 +38,12 @@ type (
 		//ThinkTime is the think time of request in seconds.
 		ThinkTime int
 		// ProxyAddr is the address of HTTP proxy server in the format on "host:port".
-		ProxyAddr   *url.URL
-		Socket5List []*Socket5
-		TCPData     [][]byte
-		TCPAddr     string
-		TCPInterval int
+		ProxyAddr    *url.URL
+		SocketList   []*Socket
+		SocketType   string
+		SendData     [][]byte
+		SocketAddr   string
+		SendInterval int
 		//H2 is an option to make HTTP/2 requests.
 		H2 bool
 		//DisableCompression is an option to disable compression in response.
@@ -60,10 +61,10 @@ type (
 	}
 )
 
-type Socket5 struct {
-	Socket5Type string
-	Socket5Addr string
-	Socket5Auth *proxy.Auth
+type Socket struct {
+	SocketType string
+	SocketAddr string
+	SocketAuth *proxy.Auth
 }
 
 //Run is run a task.
@@ -76,14 +77,14 @@ func (t *Task) Run() {
 		os.Exit(1)
 	}()
 
-	dlen := len(t.Socket5List)
+	dlen := len(t.SocketList)
 	if dlen > 0 {
 		t.Concurrent *= dlen
 		if t.Number > 0 {
 			t.Number *= dlen
 		}
 	}
-	if t.Number > 0 && t.TCPAddr == "" {
+	if t.Number > 0 && t.SocketType == "" {
 		t.results = make(chan *Result, t.Number)
 	}
 	t.start = time.Now()
@@ -92,7 +93,7 @@ func (t *Task) Run() {
 }
 
 func (t *Task) finish() {
-	if t.TCPAddr == "" {
+	if t.SocketType == "" {
 		if !t.isStop && t.Number > 0 {
 			close(t.results)
 			t.isStop = true
@@ -106,19 +107,19 @@ func (t *Task) finish() {
 }
 
 func (t *Task) runRequesters() {
-	dlen := len(t.Socket5List)
+	dlen := len(t.SocketList)
 	var wg sync.WaitGroup
 	wg.Add(t.Concurrent)
 	for i, j := 0, 0; i < t.Concurrent; i++ {
-		var socketConfig *Socket5
+		var socketConfig *Socket
 		if dlen > 0 {
-			socketConfig = t.Socket5List[j]
+			socketConfig = t.SocketList[j]
 			j++
 			if j >= dlen {
 				j = 0
 			}
 		}
-		if t.TCPAddr != "" {
+		if t.SocketType != "" {
 			go func() {
 				t.runTCPRequester(t.Number/t.Concurrent, socketConfig)
 				wg.Done()
@@ -133,7 +134,7 @@ func (t *Task) runRequesters() {
 	wg.Wait()
 }
 
-func (t *Task) runRequester(num int, socketConfig *Socket5) {
+func (t *Task) runRequester(num int, socketConfig *Socket) {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -143,7 +144,8 @@ func (t *Task) runRequester(num int, socketConfig *Socket5) {
 		Proxy:              http.ProxyURL(t.ProxyAddr),
 	}
 	if socketConfig != nil {
-		dialer, err := proxy.SOCKS5(socketConfig.Socket5Type, socketConfig.Socket5Addr, socketConfig.Socket5Auth, proxy.Direct)
+		// socketConfig.SocketType
+		dialer, err := proxy.SOCKS5("tcp", socketConfig.SocketAddr, socketConfig.SocketAuth, proxy.Direct)
 		if err != nil {
 			fmt.Println(err)
 		} else {
@@ -243,7 +245,7 @@ func (t *Task) sendRequest(client *http.Client) {
 	t.thinkDuration += thinktime
 }
 
-func (t *Task) runTCPRequester(num int, socketConfig *Socket5) {
+func (t *Task) runTCPRequester(num int, socketConfig *Socket) {
 	if t.Number < 0 {
 		for {
 			t.sendTCP(socketConfig)
@@ -255,29 +257,43 @@ func (t *Task) runTCPRequester(num int, socketConfig *Socket5) {
 	}
 }
 
-func (t *Task) sendTCP(socketConfig *Socket5) {
+func (t *Task) sendTCP(socketConfig *Socket) {
 	var conn net.Conn
 	var err error
 	if socketConfig != nil {
 		var user, pwd string
-		if socketConfig.Socket5Auth != nil {
-			user, pwd = socketConfig.Socket5Auth.User, socketConfig.Socket5Auth.Password
+		if socketConfig.SocketAuth != nil {
+			user, pwd = socketConfig.SocketAuth.User, socketConfig.SocketAuth.Password
 		}
 		var proxy proxyclient.ProxyClient
-		proxy, err = proxyclient.NewSocksProxyClient("socks5", socketConfig.Socket5Addr, user, pwd, nil, nil)
+		// proxyType := "socks5"
+		// if strings.ToLower(socketConfig.SocketType) == "udp" {
+		// 	proxyType = "socks4"
+		// }
+		proxy, err = proxyclient.NewSocksProxyClient(socketConfig.SocketType, socketConfig.SocketAddr, user, pwd, nil, nil)
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
-		conn, err = proxy.Dial("tcp", socketConfig.Socket5Addr)
+		conn, err = proxy.Dial("tcp", t.SocketAddr)
 	} else {
-		var tcpAddr *net.TCPAddr
-		tcpAddr, err = net.ResolveTCPAddr("tcp4", t.TCPAddr)
-		if err != nil {
-			fmt.Println(err)
-			return
+		if t.SocketType == "tcp" {
+			var tcpAddr *net.TCPAddr
+			tcpAddr, err = net.ResolveTCPAddr("tcp4", t.SocketAddr)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			conn, err = net.DialTCP("tcp", nil, tcpAddr)
+		} else {
+			var udpAddr *net.UDPAddr
+			udpAddr, err = net.ResolveUDPAddr("udp4", t.SocketAddr)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			conn, err = net.DialUDP("udp", nil, udpAddr)
 		}
-		conn, err = net.DialTCP("tcp", nil, tcpAddr)
 	}
 	if err != nil {
 		fmt.Println(err)
@@ -287,9 +303,9 @@ func (t *Task) sendTCP(socketConfig *Socket5) {
 		fmt.Println("conn is nil")
 		return
 	}
-	for _, data := range t.TCPData {
+	for _, data := range t.SendData {
 		conn.Write(data)
-		time.Sleep(time.Duration(t.TCPInterval) * time.Millisecond)
+		time.Sleep(time.Duration(t.SendInterval) * time.Millisecond)
 	}
 	conn.Close()
 }
