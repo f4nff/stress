@@ -1,7 +1,12 @@
 package proxyclient
 
 import (
+	"errors"
+	"fmt"
 	"net"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -119,3 +124,97 @@ type ProxyClient interface {
 //              G|ET /pa|th H|TTTP/1.0
 //              HO|ST:www.aa|dd.com
 //     可选参数： sleep=0  建立连接后延迟多少毫秒发送数据，配合 ttl 反劫持系统时建议设置为10置50。默认值 0 .
+
+func NewProxyClient(addr string) (ProxyClient, error) {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return nil, errors.New("addr 错误的格式")
+	}
+
+	// 将 query key 转换成为小写
+	_query := u.Query()
+	query := make(map[string][]string, len(_query))
+	for k, v := range _query {
+		query[strings.ToLower(k)] = v
+	}
+
+	queryGet := func(key string) string {
+		if query == nil {
+			return ""
+		}
+		v, ok := query[key]
+		if !ok || len(v) == 0 {
+			return ""
+		}
+		return v[0]
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+
+	var upProxy ProxyClient
+	if up, ok := query["upproxy"]; ok == true {
+		if upProxy, err = NewProxyClient(up[0]); err != nil {
+			return nil, fmt.Errorf("upProxy 创建失败：%v", err)
+		}
+	}
+
+	switch scheme {
+	case "direct":
+		localAddr := queryGet("localaddr")
+		if localAddr == "" {
+			localAddr = ":0"
+		}
+
+		splitHttp := false
+		if strings.ToLower(queryGet("splithttp")) == "true" {
+			splitHttp = true
+		}
+
+		sleep := 0 * time.Millisecond
+		if queryGet("sleep") != "" {
+			if s, err := strconv.Atoi(queryGet("sleep")); err != nil {
+				return nil, fmt.Errorf("sleep 参数错误：%v", err)
+			} else {
+				sleep = time.Duration(s) * time.Millisecond
+			}
+		}
+
+		return newDriectProxyClient(localAddr, splitHttp, sleep, query)
+
+	case "socks4", "socks4a", "socks5":
+		username := ""
+		password := ""
+		if u.User != nil {
+			username = u.User.Username()
+			password, _ = u.User.Password()
+		}
+
+		return NewSocksProxyClient(scheme, u.Host, username, password, upProxy, query)
+	case "http", "https":
+		auth := ""
+		if u.User != nil {
+			auth = u.User.String()
+		}
+
+		standardHeader := false
+		if strings.ToLower(queryGet("standardheader")) == "true" {
+			standardHeader = true
+		}
+
+		insecureSkipVerify := false
+		if strings.ToLower(queryGet("insecureskipverify")) == "true" {
+			insecureSkipVerify = true
+		}
+
+		domain := queryGet("domain")
+
+		return newHTTPProxyClient(scheme, u.Host, domain, auth, insecureSkipVerify, standardHeader, upProxy, query)
+	case "ss":
+		password, ok := u.User.Password()
+		if ok == false {
+			return nil, fmt.Errorf("ss 代理 method, password 格式错误。")
+		}
+		return newSsProxyClient(u.Host, u.User.Username(), password, upProxy, query)
+	default:
+		return nil, fmt.Errorf("未识别的代理类型：%v", scheme)
+	}
+}
