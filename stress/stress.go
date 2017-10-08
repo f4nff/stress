@@ -3,17 +3,20 @@ package stress
 import (
 	"bytes"
 	"crypto/tls"
-	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
+	"github.com/f4nff/stress/stress/proxyclient"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 
 	"golang.org/x/net/http2"
 )
@@ -21,30 +24,26 @@ import (
 type (
 	//Task contains the stress test configuration and request configuration.
 	Task struct {
+		// Request is the request to be made.
+		Request *http.Request
+		//ReqBody is the request of body.
+		ReqBody []byte
 		//Nuber is the total number of requests to send.
 		Number int
 		//Concurrent is the concurrent number of requests.
 		Concurrent int
-		//Duration is the duration of requests.
-		Duration time.Duration
-		//Output is the report output directory.
-		//The output contains the summary information file and the CSV file for each request.
-		Output string
-		//Processing result reporting function.
-		//If the function is passed in, the incoming function is used to process the report,
-		//otherwise the default function is used to process the report.
-		ReportHandler func(results []*Result, totalTime time.Duration)
-
-		//Global configuration, if the configuration is not specified in RequestConfig,
-		//use the settings global configuration.
+		Output     string
 		//Timeout is the timeout of request in seconds.
 		Timeout int
 		//ThinkTime is the think time of request in seconds.
 		ThinkTime int
 		// ProxyAddr is the address of HTTP proxy server in the format on "host:port".
-		ProxyAddr *url.URL
-		//HTTP Host header
-		Host string
+		ProxyAddr    *url.URL
+		SocketList   []*Socket
+		SocketType   string
+		SendData     [][]byte
+		SocketAddr   string
+		SendInterval int
 		//H2 is an option to make HTTP/2 requests.
 		H2 bool
 		//DisableCompression is an option to disable compression in response.
@@ -56,63 +55,20 @@ type (
 
 		//The total think time required for all requests.
 		thinkDuration time.Duration
-		reqConfigs    []*RequestConfig
 		start         time.Time
-		results       []*Result
-		mx            sync.Mutex
-	}
-	//RequestConfig is the request of configuration.
-	RequestConfig struct {
-		//URLStr is the request of URL.
-		URLStr string
-		//Method is the request of method.
-		Method string
-		//ReqBody is the request of body.
-		ReqBody []byte
-		//Header is the request of header.
-		Header http.Header
-		//Events is the custom event in the request.
-		//Contains the function before the request and the function after the response.
-		Events *Events
-
-		//Timeout is the timeout of request in seconds.
-		Timeout int
-		//ThinkTime is the think time of request in seconds.
-		ThinkTime int
-		// ProxyAddr is the address of HTTP proxy server in the format on "host:port".
-		ProxyAddr *url.URL
-		//HTTP Host header
-		Host string
-		//H2 is an option to make HTTP/2 requests.
-		H2 bool
-		//DisableCompression is an option to disable compression in response.
-		DisableCompression bool
-		//DisableKeepAlives is an option to prevents re-use of TCP connections between different HTTP requests.
-		DisableKeepAlives bool
-		//DisableRedirects is an option to prevent the following of HTTP redirects.
-		DisableRedirects bool
-
-		request *http.Request
-		client  *http.Client
+		results       chan *Result
+		isStop        bool
 	}
 )
 
+type Socket struct {
+	SocketType string
+	SocketAddr string
+	SocketAuth *proxy.Auth
+}
+
 //Run is run a task.
-func (t *Task) Run(config *RequestConfig) error {
-	t.reqConfigs = append([]*RequestConfig(nil), config)
-	return t.run()
-}
-
-//RunTran is run a transactional task.
-func (t *Task) RunTran(configs ...*RequestConfig) error {
-	t.reqConfigs = append([]*RequestConfig(nil), configs...)
-	return t.run()
-}
-
-func (t *Task) run() error {
-	if err := t.checkAndInitConfigs(); err != nil {
-		return err
-	}
+func (t *Task) Run() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
@@ -120,212 +76,238 @@ func (t *Task) run() error {
 		t.finish()
 		os.Exit(1)
 	}()
+
+	dlen := len(t.SocketList)
+	if dlen > 0 {
+		t.Concurrent *= dlen
+		if t.Number > 0 {
+			t.Number *= dlen
+		}
+	}
+	if t.Number > 0 && t.SocketType == "" {
+		t.results = make(chan *Result, t.Number)
+	}
 	t.start = time.Now()
-	t.makeHTTPClient()
 	t.runRequesters()
 	t.finish()
-	return nil
 }
 
 func (t *Task) finish() {
-	if t.Number < 0 && t.ReportHandler == nil {
-		return
-	}
-	total := time.Now().Sub(t.start) - t.thinkDuration
-	if t.ReportHandler != nil {
-		t.ReportHandler(t.results, total)
-	} else {
-		newReport(t.results, t.Output, total).finalize()
+	if t.SocketType == "" {
+		if !t.isStop && t.Number > 0 {
+			close(t.results)
+			t.isStop = true
+		}
+		if t.Number < 0 {
+			return
+		}
+		total := time.Now().Sub(t.start) - t.thinkDuration
+		newReport(os.Stdout, t.results, t.Output, total).finalize()
 	}
 }
 
 func (t *Task) runRequesters() {
+	dlen := len(t.SocketList)
 	var wg sync.WaitGroup
 	wg.Add(t.Concurrent)
-
-	for i := 0; i < t.Concurrent; i++ {
-		go func(routineNum int) {
-			t.runRequester(t.Number/t.Concurrent, routineNum)
-			wg.Done()
-		}(i)
+	for i, j := 0, 0; i < t.Concurrent; i++ {
+		var socketConfig *Socket
+		if dlen > 0 {
+			socketConfig = t.SocketList[j]
+			j++
+			if j >= dlen {
+				j = 0
+			}
+		}
+		if t.SocketType != "" {
+			go func() {
+				t.runTCPRequester(t.Number/t.Concurrent, socketConfig)
+				wg.Done()
+			}()
+		} else {
+			go func() {
+				t.runRequester(t.Number/t.Concurrent, socketConfig)
+				wg.Done()
+			}()
+		}
 	}
 	wg.Wait()
 }
 
-func (t *Task) runRequester(num, no int) {
-	i := 0
-	if t.Duration > 0 || t.Number < 0 {
-		for {
-			if t.Duration > 0 && time.Now().Sub(t.start) >= t.Duration {
-				break
-			}
-			t.sendRequest(no, i)
-			i++
-		}
-		return
+func (t *Task) runRequester(num int, socketConfig *Socket) {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DisableCompression: t.DisableCompression,
+		DisableKeepAlives:  t.DisableKeepAlives,
+		Proxy:              http.ProxyURL(t.ProxyAddr),
 	}
-	for ; i < num; i++ {
-		t.sendRequest(no, i)
-	}
-}
-
-func (t *Task) makeHTTPClient() {
-	//Create http.Client.
-	for i, reqConfig := range t.reqConfigs {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			DisableCompression: reqConfig.DisableCompression,
-			DisableKeepAlives:  reqConfig.DisableKeepAlives,
-			Proxy:              http.ProxyURL(reqConfig.ProxyAddr),
-		}
-		if reqConfig.H2 {
-			http2.ConfigureTransport(transport)
+	if socketConfig != nil {
+		// socketConfig.SocketType
+		dialer, err := proxy.SOCKS5("tcp", socketConfig.SocketAddr, socketConfig.SocketAuth, proxy.Direct)
+		if err != nil {
+			fmt.Println(err)
 		} else {
-			transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+			transport.Dial = dialer.Dial
 		}
-		client := &http.Client{
-			Transport: transport,
-			Timeout:   time.Duration(reqConfig.Timeout) * time.Second,
+	}
+	if t.H2 {
+		http2.ConfigureTransport(transport)
+	} else {
+		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Duration(t.Timeout) * time.Second,
+	}
+	if t.DisableRedirects {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		}
-		if reqConfig.DisableRedirects {
-			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			}
+	}
+	if t.Number < 0 {
+		for {
+			t.sendRequest(client)
 		}
-		t.reqConfigs[i].client = client
+	} else {
+		for i := 0; i < num; i++ {
+			t.sendRequest(client)
+		}
 	}
 }
 
-func (t *Task) sendRequest(no, index int) {
-	//init share and results.
-	len := len(t.reqConfigs)
-	share := make(Share, len)
-	results := &Result{
-		Details: make([]*ResultDetail, len),
-	}
-	tranStart := time.Now()
+func (t *Task) sendRequest(client *http.Client) {
 	var thinkDuration time.Duration
-	for i, reqConfig := range t.reqConfigs {
-		start := time.Now()
-		var size int64
-		var code int
-		var dnsStart, connStart, reqStart, resStart, delayStart, reqBeforeStart, resAfterStart time.Time
-		var dnsDuration, connDuration, reqDuration, resDuration, delayDuration, reqBeforeDuration, resAfterDuration time.Duration
-		req := cloneRequest(reqConfig.request, reqConfig.ReqBody)
-		req.Host = reqConfig.Host
-		//Handle custom event: function before the request.
-		reqBeforeStart = time.Now()
-		if reqConfig.Events != nil && reqConfig.Events.RequestBefore != nil {
-			reqInfo := &Request{
-				GoRoutineNo: no,
-				Index:       index,
-				Req:         req,
-			}
-			reqConfig.Events.RequestBefore(reqInfo, share)
-		}
-		reqBeforeDuration = time.Now().Sub(reqBeforeStart)
-		//Create http.Client.
-		// client := reqConfig.client
-		// if client == nil {
-		// 	transport := &http.Transport{
-		// 		TLSClientConfig: &tls.Config{
-		// 			InsecureSkipVerify: true,
-		// 		},
-		// 		DisableCompression: reqConfig.DisableCompression,
-		// 		DisableKeepAlives:  reqConfig.DisableKeepAlives,
-		// 		Proxy:              http.ProxyURL(reqConfig.ProxyAddr),
-		// 	}
-		// 	if reqConfig.H2 {
-		// 		http2.ConfigureTransport(transport)
-		// 	} else {
-		// 		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-		// 	}
-		// 	client = &http.Client{
-		// 		Transport: transport,
-		// 		Timeout:   time.Duration(reqConfig.Timeout) * time.Second,
-		// 	}
-		// 	if reqConfig.DisableRedirects {
-		// 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		// 			return http.ErrUseLastResponse
-		// 		}
-		// 	}
-		// 	t.mx.Lock()
-		// 	t.reqConfigs[i].client = client
-		// 	t.mx.Unlock()
-		// }
-		//Create httptrace.
-		trace := &httptrace.ClientTrace{
-			DNSStart: func(httptrace.DNSStartInfo) {
-				dnsStart = time.Now()
-			},
-			DNSDone: func(httptrace.DNSDoneInfo) {
-				dnsDuration = time.Now().Sub(dnsStart)
-			},
-			GetConn: func(h string) {
-				connStart = time.Now()
-			},
-			GotConn: func(connInfo httptrace.GotConnInfo) {
-				connDuration = time.Now().Sub(connStart)
-				reqStart = time.Now()
-			},
-			WroteRequest: func(w httptrace.WroteRequestInfo) {
-				reqDuration = time.Now().Sub(reqStart)
-				delayStart = time.Now()
-			},
-			GotFirstResponseByte: func() {
-				delayDuration = time.Now().Sub(delayStart)
-				resStart = time.Now()
-			},
-		}
-		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
-		res, err := reqConfig.client.Do(req)
-		if err == nil {
-			size = res.ContentLength
-			code = res.StatusCode
-			//Handle custom event: function after the response.
-			resAfterStart = time.Now()
-			if reqConfig.Events != nil && reqConfig.Events.ResponseAfter != nil {
-				reqConfig.Events.ResponseAfter(res, share)
-			}
-			resAfterDuration = time.Now().Sub(resAfterStart)
-			io.Copy(ioutil.Discard, res.Body)
-			res.Body.Close()
-		}
-		nowTime := time.Now()
-		resDuration = nowTime.Sub(resStart)
-		end := nowTime.Sub(start)
-		results.Details[i] = &ResultDetail{
-			URLStr:            req.URL.String(),
-			Method:            req.Method,
-			Err:               err,
-			StatusCode:        code,
-			Duration:          end - reqBeforeDuration - resAfterDuration,
-			ConnDuration:      connDuration,
-			DNSDuration:       dnsDuration,
-			ReqDuration:       reqDuration,
-			ResDuration:       resDuration,
-			DelayDuration:     delayDuration,
-			ReqBeforeDuration: reqBeforeDuration,
-			ResAfterDuration:  resAfterDuration,
-			ContentLength:     size,
-		}
-		//Handle think time.
-		thinktime := time.Duration(reqConfig.ThinkTime) * time.Second
-		time.Sleep(thinktime)
-		thinkDuration += thinktime
-		t.thinkDuration += thinktime
+	start := time.Now()
+	var size int64
+	var code int
+	var dnsStart, connStart, reqStart, resStart, delayStart time.Time
+	var dnsDuration, connDuration, reqDuration, resDuration, delayDuration time.Duration
+	req := cloneRequest(t.Request, t.ReqBody)
+	//Create httptrace.
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			dnsStart = time.Now()
+		},
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			dnsDuration = time.Now().Sub(dnsStart)
+		},
+		GetConn: func(h string) {
+			connStart = time.Now()
+		},
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			connDuration = time.Now().Sub(connStart)
+			reqStart = time.Now()
+		},
+		WroteRequest: func(w httptrace.WroteRequestInfo) {
+			reqDuration = time.Now().Sub(reqStart)
+			delayStart = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			delayDuration = time.Now().Sub(delayStart)
+			resStart = time.Now()
+		},
 	}
-	finish := time.Now().Sub(tranStart)
-	results.Duration = finish - thinkDuration
-	//Save request result.
-	if t.Number < 0 && t.ReportHandler == nil {
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	res, err := client.Do(req)
+	if err == nil {
+		size = res.ContentLength
+		code = res.StatusCode
+		io.Copy(ioutil.Discard, res.Body)
+		res.Body.Close()
+	} else {
+		fmt.Println(err)
+	}
+	nowTime := time.Now()
+	resDuration = nowTime.Sub(resStart)
+	end := nowTime.Sub(start)
+	result := &Result{
+		URLStr:        req.URL.String(),
+		Method:        req.Method,
+		Err:           err,
+		StatusCode:    code,
+		Duration:      end,
+		ConnDuration:  connDuration,
+		DNSDuration:   dnsDuration,
+		ReqDuration:   reqDuration,
+		ResDuration:   resDuration,
+		DelayDuration: delayDuration,
+		ContentLength: size,
+	}
+	if t.Number > 0 && !t.isStop {
+		t.results <- result
+	}
+	//Handle think time.
+	thinktime := time.Duration(t.ThinkTime) * time.Second
+	time.Sleep(thinktime)
+	thinkDuration += thinktime
+	t.thinkDuration += thinktime
+}
+
+func (t *Task) runTCPRequester(num int, socketConfig *Socket) {
+	if t.Number < 0 {
+		for {
+			t.sendTCP(socketConfig)
+		}
+	} else {
+		for i := 0; i < num; i++ {
+			t.sendTCP(socketConfig)
+		}
+	}
+}
+
+func (t *Task) sendTCP(socketConfig *Socket) {
+	var conn net.Conn
+	var err error
+	if socketConfig != nil {
+		var user, pwd string
+		if socketConfig.SocketAuth != nil {
+			user, pwd = socketConfig.SocketAuth.User, socketConfig.SocketAuth.Password
+		}
+		var proxy proxyclient.ProxyClient
+		// proxyType := "socks5"
+		// if strings.ToLower(socketConfig.SocketType) == "udp" {
+		// 	proxyType = "socks4"
+		// }
+		proxy, err = proxyclient.NewSocksProxyClient(socketConfig.SocketType, socketConfig.SocketAddr, user, pwd, nil, nil)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		conn, err = proxy.Dial("tcp", t.SocketAddr)
+	} else {
+		if t.SocketType == "tcp" {
+			var tcpAddr *net.TCPAddr
+			tcpAddr, err = net.ResolveTCPAddr("tcp4", t.SocketAddr)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			conn, err = net.DialTCP("tcp", nil, tcpAddr)
+		} else {
+			var udpAddr *net.UDPAddr
+			udpAddr, err = net.ResolveUDPAddr("udp4", t.SocketAddr)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+			conn, err = net.DialUDP("udp", nil, udpAddr)
+		}
+	}
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
-	t.mx.Lock()
-	t.results = append(t.results, results)
-	t.mx.Unlock()
+	if conn == nil {
+		fmt.Println("conn is nil")
+		return
+	}
+	for _, data := range t.SendData {
+		conn.Write(data)
+		time.Sleep(time.Duration(t.SendInterval) * time.Millisecond)
+	}
+	conn.Close()
 }
 
 func cloneRequest(r *http.Request, body []byte) *http.Request {
@@ -339,71 +321,4 @@ func cloneRequest(r *http.Request, body []byte) *http.Request {
 		req.Body = ioutil.NopCloser(bytes.NewReader(body))
 	}
 	return req
-}
-
-func (t *Task) checkAndInitConfigs() error {
-	if t.Number == 0 && t.Duration <= 0 {
-		return errors.New("Number or Duration cannot be smaller than 1")
-	}
-	if t.Number != 0 && t.Duration > 0 {
-		return errors.New("Number and Duration only set one")
-	}
-	if t.Concurrent <= 0 {
-		return errors.New("Concurrent cannot be smaller than 1")
-	}
-	if t.Number > 0 && t.Number < t.Concurrent {
-		return errors.New("Number cannot be less than Concurrent")
-	}
-	if t.Number > 0 && t.Number%t.Concurrent != 0 {
-		return errors.New("Number must be an integer multiple of Concurrent")
-	}
-	if t.Output != "" {
-		err := os.MkdirAll(t.Output, 0777)
-		if err != nil {
-			return err
-		}
-	}
-	if t.Duration <= 0 && t.Number > 0 {
-		t.results = make([]*Result, 0, t.Number)
-	}
-	for i, n := 0, len(t.reqConfigs); i < n; i++ {
-		if t.reqConfigs[i] == nil {
-			return errors.New("RequestConfig cannot be nil")
-		}
-		if t.reqConfigs[i].URLStr == "" || t.reqConfigs[i].Method == "" {
-			return errors.New("URLStr and Method cannot be empty")
-		}
-		if t.Timeout > 0 && t.reqConfigs[i].Timeout <= 0 {
-			t.reqConfigs[i].Timeout = t.Timeout
-		}
-		if t.ThinkTime > 0 && t.reqConfigs[i].ThinkTime <= 0 {
-			t.reqConfigs[i].ThinkTime = t.ThinkTime
-		}
-		if t.Host != "" && t.reqConfigs[i].Host == "" {
-			t.reqConfigs[i].Host = t.Host
-		}
-		if t.ProxyAddr != nil && t.reqConfigs[i].ProxyAddr == nil {
-			t.reqConfigs[i].ProxyAddr = t.ProxyAddr
-		}
-		if t.DisableCompression && !t.reqConfigs[i].DisableCompression {
-			t.reqConfigs[i].DisableCompression = true
-		}
-		if t.DisableKeepAlives && !t.reqConfigs[i].DisableKeepAlives {
-			t.reqConfigs[i].DisableKeepAlives = true
-		}
-		if t.DisableRedirects && !t.reqConfigs[i].DisableRedirects {
-			t.reqConfigs[i].DisableRedirects = true
-		}
-		t.reqConfigs[i].Method = strings.ToUpper(t.reqConfigs[i].Method)
-		req, err := http.NewRequest(t.reqConfigs[i].Method, t.reqConfigs[i].URLStr, nil)
-		if err != nil {
-			return err
-		}
-		if t.reqConfigs[i].Header != nil {
-			req.Header = t.reqConfigs[i].Header
-		}
-		t.reqConfigs[i].request = req
-	}
-
-	return nil
 }

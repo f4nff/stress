@@ -1,0 +1,4 @@
+stress -n 1 -c 1 -send-data "2323.txt" -socket-proxy-file "s5.json" -send-interval 5 -tcp 97.64.17.160:9003
+
+
+stress -n 1 -c 1 -send-data "2323.txt" -socket-proxy-file "s4.json" -send-interval 5 -tcp 97.64.17.160:9003

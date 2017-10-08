@@ -3,8 +3,6 @@ package stress
 import (
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -17,13 +15,6 @@ const (
 type (
 	//Result is task result.
 	Result struct {
-		//Details is request details.
-		Details []*ResultDetail
-		//Duration is the total duration of multiple requests in a transactional request.
-		Duration time.Duration
-	}
-	//ResultDetail is request result details.
-	ResultDetail struct {
 		//URLStr is the request of URL.
 		URLStr string
 		//Method is the request of method.
@@ -52,114 +43,93 @@ type (
 		ContentLength int64
 	}
 	report struct {
-		total          time.Duration
-		reqBeforeTotal time.Duration
-		resAfterTotal  time.Duration
-		avgTotal       float64
-		fastest        float64
-		slowest        float64
-		average        float64
-		rps            float64
+		avgTotal float64
+		fastest  float64
+		slowest  float64
+		average  float64
+		rps      float64
 
-		results    []*Result
-		lats       []float64
-		details    []*detail
-		writers    []io.Writer
-		csvWriters []io.Writer
-		output     string
-	}
-	detail struct {
-		url            string
-		method         string
-		avgConn        float64
-		avgDNS         float64
-		avgReqBefore   float64
-		avgReq         float64
-		avgResAfter    float64
-		avgRes         float64
-		avgDelay       float64
-		connLats       []float64
-		dnsLats        []float64
-		reqBeforeLats  []float64
-		reqLats        []float64
-		resAfterLats   []float64
-		resLats        []float64
-		delayLats      []float64
-		statusCodeDist map[int]int
+		avgConn   float64
+		avgDNS    float64
+		avgReq    float64
+		avgRes    float64
+		avgDelay  float64
+		connLats  []float64
+		dnsLats   []float64
+		reqLats   []float64
+		resLats   []float64
+		delayLats []float64
+
+		results chan *Result
+		total   time.Duration
+
 		errorDist      map[string]int
+		statusCodeDist map[int]int
+		lats           []float64
 		sizeTotal      int64
+
+		output string
+
+		w io.Writer
 	}
 )
 
-func newReport(results []*Result, output string, total time.Duration) *report {
+func newReport(w io.Writer, results chan *Result, output string, total time.Duration) *report {
 	return &report{
-		output:  output,
-		results: results,
-		total:   total,
+		output:         output,
+		results:        results,
+		total:          total,
+		statusCodeDist: make(map[int]int),
+		errorDist:      make(map[string]int),
+		w:              w,
 	}
 }
 
 func (r *report) finalize() {
-	for _, result := range r.results {
-		r.lats = append(r.lats, result.Duration.Seconds())
-		r.avgTotal += result.Duration.Seconds()
-		if r.details == nil {
-			r.details = make([]*detail, len(result.Details))
-		}
-		for i, res := range result.Details {
-			if r.details[i] == nil {
-				r.details[i] = &detail{
-					statusCodeDist: make(map[int]int),
-					errorDist:      make(map[string]int),
-				}
-
-			}
-			r.details[i].url = res.URLStr
-			r.details[i].method = res.Method
-			if res.Err != nil {
-				r.details[i].errorDist[res.Err.Error()]++
-			} else {
-				r.reqBeforeTotal += res.ReqBeforeDuration
-				r.resAfterTotal += res.ResAfterDuration
-				r.details[i].avgConn += res.ConnDuration.Seconds()
-				r.details[i].avgDelay += res.DelayDuration.Seconds()
-				r.details[i].avgDNS += res.DNSDuration.Seconds()
-				r.details[i].avgReqBefore += res.ReqBeforeDuration.Seconds()
-				r.details[i].avgReq += res.ReqDuration.Seconds()
-				r.details[i].avgResAfter += res.ResAfterDuration.Seconds()
-				r.details[i].avgRes += res.ResDuration.Seconds()
-				r.details[i].connLats = append(r.details[i].connLats, res.ConnDuration.Seconds())
-				r.details[i].dnsLats = append(r.details[i].dnsLats, res.DNSDuration.Seconds())
-				r.details[i].reqBeforeLats = append(r.details[i].reqBeforeLats, res.ReqBeforeDuration.Seconds())
-				r.details[i].reqLats = append(r.details[i].reqLats, res.ReqDuration.Seconds())
-				r.details[i].delayLats = append(r.details[i].delayLats, res.DelayDuration.Seconds())
-				r.details[i].resAfterLats = append(r.details[i].resAfterLats, res.ResAfterDuration.Seconds())
-				r.details[i].resLats = append(r.details[i].resLats, res.ResDuration.Seconds())
-				r.details[i].statusCodeDist[res.StatusCode]++
-				if res.ContentLength > 0 {
-					r.details[i].sizeTotal += res.ContentLength
-				}
+	for res := range r.results {
+		if res.Err != nil {
+			r.errorDist[res.Err.Error()]++
+		} else {
+			r.lats = append(r.lats, res.Duration.Seconds())
+			r.avgTotal += res.Duration.Seconds()
+			r.avgConn += res.ConnDuration.Seconds()
+			r.avgDelay += res.DelayDuration.Seconds()
+			r.avgDNS += res.DNSDuration.Seconds()
+			r.avgReq += res.ReqDuration.Seconds()
+			r.avgRes += res.ResDuration.Seconds()
+			r.connLats = append(r.connLats, res.ConnDuration.Seconds())
+			r.dnsLats = append(r.dnsLats, res.DNSDuration.Seconds())
+			r.reqLats = append(r.reqLats, res.ReqDuration.Seconds())
+			r.delayLats = append(r.delayLats, res.DelayDuration.Seconds())
+			r.resLats = append(r.resLats, res.ResDuration.Seconds())
+			r.statusCodeDist[res.StatusCode]++
+			if res.ContentLength > 0 {
+				r.sizeTotal += res.ContentLength
 			}
 		}
 	}
 	r.rps = float64(len(r.lats)) / r.total.Seconds()
 	r.average = r.avgTotal / float64(len(r.lats))
-	for i, n := 0, len(r.details); i < n; i++ {
-		r.details[i].avgConn = r.details[i].avgConn / float64(len(r.lats))
-		r.details[i].avgDelay = r.details[i].avgDelay / float64(len(r.lats))
-		r.details[i].avgDNS = r.details[i].avgDNS / float64(len(r.lats))
-		r.details[i].avgReqBefore = r.details[i].avgReqBefore / float64(len(r.lats))
-		r.details[i].avgReq = r.details[i].avgReq / float64(len(r.lats))
-		r.details[i].avgResAfter = r.details[i].avgResAfter / float64(len(r.lats))
-		r.details[i].avgRes = r.details[i].avgRes / float64(len(r.lats))
-	}
+	r.avgConn = r.avgConn / float64(len(r.lats))
+	r.avgDelay = r.avgDelay / float64(len(r.lats))
+	r.avgDNS = r.avgDNS / float64(len(r.lats))
+	r.avgReq = r.avgReq / float64(len(r.lats))
+	r.avgRes = r.avgRes / float64(len(r.lats))
 	r.print()
 }
 
+func (r *report) printCSV() {
+	r.printf("response-time,DNS+dialup,DNS,Request-write,Response-delay,Response-read\n")
+	for i, val := range r.lats {
+		r.printf("%4.4f,%4.4f,%4.4f,%4.4f,%4.4f,%4.4f\n",
+			val, r.connLats[i], r.dnsLats[i], r.reqLats[i], r.delayLats[i], r.resLats[i])
+	}
+}
+
 func (r *report) print() {
-	r.setWriter()
-	if r.output != "" {
-		r.printCSV(r.csvWriters...)
+	if r.output == "csv" {
+		r.printCSV()
+		return
 	}
 
 	if len(r.lats) > 0 {
@@ -167,70 +137,32 @@ func (r *report) print() {
 		r.fastest = r.lats[0]
 		r.slowest = r.lats[len(r.lats)-1]
 		r.printf("\nSummary:\n")
-		r.printf("  Total:\t\t%4.4f secs\n", r.total.Seconds())
-		r.printf("  ReqBeforeTotal:\t%4.4f secs\n", r.reqBeforeTotal.Seconds())
-		r.printf("  ResAfterTotal:\t%4.4f secs\n", r.resAfterTotal.Seconds())
-		r.printf("  Slowest:\t\t%4.4f secs\n", r.slowest)
-		r.printf("  Fastest:\t\t%4.4f secs\n", r.fastest)
-		r.printf("  Average:\t\t%4.4f secs\n", r.average)
-		r.printf("  Requests/sec:\t\t%4.4f\n", r.rps)
+		r.printf("  Total:\t%4.4f secs\n", r.total.Seconds())
+		r.printf("  Slowest:\t%4.4f secs\n", r.slowest)
+		r.printf("  Fastest:\t%4.4f secs\n", r.fastest)
+		r.printf("  Average:\t%4.4f secs\n", r.average)
+		r.printf("  Requests/sec:\t%4.4f\n", r.rps)
+		if r.sizeTotal > 0 {
+			r.printf("  Total data:\t%d bytes\n", r.sizeTotal)
+			r.printf("  Size/request:\t%d bytes\n", r.sizeTotal/int64(len(r.lats)))
+		}
 		r.printf("\nDetailed Report:\n")
-		for _, detail := range r.details {
-			r.printf("\n  URL:  [%s] %s\n", detail.method, detail.url)
-			if len(detail.resLats) > 0 {
-				r.printSection("DNS+dialup", detail.avgConn, detail.connLats)
-				r.printSection("DNS-lookup", detail.avgDNS, detail.dnsLats)
-				r.printSection("Request Before", detail.avgReqBefore, detail.reqBeforeLats)
-				r.printSection("Request Write", detail.avgReq, detail.reqLats)
-				r.printSection("Response Wait", detail.avgDelay, detail.delayLats)
-				r.printSection("Response After", detail.avgResAfter, detail.resAfterLats)
-				r.printSection("Response Read", detail.avgRes, detail.resLats)
-				if detail.sizeTotal > 0 {
-					r.printf("\n\tResponse Summary:\n")
-					r.printf("\t\tTotal data:\t%d bytes\n", detail.sizeTotal)
-					r.printf("\t\tSize/request:\t%d bytes\n", detail.sizeTotal/int64(len(r.lats)))
-				}
-				r.printStatusCodes(detail.statusCodeDist)
-			}
-			if len(detail.errorDist) > 0 {
-				r.printErrors(detail.errorDist)
-			}
-		}
+		r.printSection("DNS+dialup", r.avgConn, r.connLats)
+		r.printSection("DNS-lookup", r.avgDNS, r.dnsLats)
+		r.printSection("Request Write", r.avgReq, r.reqLats)
+		r.printSection("Response Wait", r.avgDelay, r.delayLats)
+		r.printSection("Response Read", r.avgRes, r.resLats)
+		r.printStatusCodes()
 		r.printHistogram()
+		// r.printLatencies()
+	}
+
+	if len(r.errorDist) > 0 {
+		r.printErrors()
 	}
 }
 
-func (r *report) setWriter() {
-	r.writers = append(r.writers, os.Stdout)
-	if r.output != "" {
-		fpath := filepath.Join(r.output, "report.txt")
-		file, err := os.Create(fpath)
-		if err == nil {
-			r.writers = append(r.writers, file)
-		}
-		for _, detail := range r.details {
-			_, f := filepath.Split(strings.Replace(strings.Replace(detail.url, ".", "_", -1), ":", "_", -1))
-			fpath := filepath.Join(r.output, f)
-			file, err := os.Create(fmt.Sprintf("%s.csv", fpath))
-			if err == nil {
-				r.csvWriters = append(r.csvWriters, file)
-			}
-		}
-	}
-}
-
-func (r *report) printCSV(writers ...io.Writer) {
-	for _, writer := range writers {
-		fmt.Fprintf(writer, "response-time,DNS+dialup,DNS,Request-before,Request-write,Response-delay,Response-after,Response-read\n")
-		for _, detail := range r.details {
-			for i, val := range detail.reqLats {
-				fmt.Fprintf(writer, "%4.4f,%4.4f,%4.4f,%4.4f,%4.4f,%4.4f,%4.4f,%4.4f\n",
-					val, detail.connLats[i], detail.dnsLats[i], detail.reqBeforeLats[i], detail.reqLats[i], detail.delayLats[i], detail.resAfterLats[i], detail.resLats[i])
-			}
-		}
-	}
-}
-
+// printSection prints details for http-trace fields
 func (r *report) printSection(tag string, avg float64, lats []float64) {
 	sort.Float64s(lats)
 	fastest, slowest := lats[0], lats[len(lats)-1]
@@ -240,6 +172,7 @@ func (r *report) printSection(tag string, avg float64, lats []float64) {
 	r.printf("  \t\tSlowest:\t%4.4f secs\n", slowest)
 }
 
+// printLatencies prints percentile latencies.
 func (r *report) printLatencies() {
 	pctls := []int{10, 25, 50, 75, 90, 95, 99}
 	data := make([]float64, len(pctls))
@@ -292,22 +225,21 @@ func (r *report) printHistogram() {
 	}
 }
 
-func (r *report) printStatusCodes(statusCodeDist map[int]int) {
-	r.printf("\n\tStatus code distribution:\n")
-	for code, num := range statusCodeDist {
-		r.printf("\t\t[%d]\t%d responses\n", code, num)
+// printStatusCodes prints status code distribution.
+func (r *report) printStatusCodes() {
+	r.printf("\nStatus code distribution:\n")
+	for code, num := range r.statusCodeDist {
+		r.printf("  [%d]\t%d responses\n", code, num)
 	}
 }
 
-func (r *report) printErrors(errorDist map[string]int) {
-	r.printf("\n\tError distribution:\n")
-	for err, num := range errorDist {
-		r.printf("\t\t[%d]\t%s\n", num, err)
+func (r *report) printErrors() {
+	r.printf("\nError distribution:\n")
+	for err, num := range r.errorDist {
+		r.printf("  [%d]\t%s\n", num, err)
 	}
 }
 
 func (r *report) printf(s string, v ...interface{}) {
-	for _, writer := range r.writers {
-		fmt.Fprintf(writer, s, v...)
-	}
+	fmt.Fprintf(r.w, s, v...)
 }
